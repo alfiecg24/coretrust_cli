@@ -9,6 +9,7 @@
 #include <choma/FileStream.h>
 #include <choma/Host.h>
 #include <choma/CSBlob.h>
+#include <choma/CodeDirectory.h>
 
 #include "CoreTrust.h"
 
@@ -94,15 +95,19 @@ char *extract_preferred_slice(const char *fatPath)
 void print_usage(const char *self) {
   printf("Options: \n");
   printf("\t-i: input file\n");
+  printf("\t-c: input CMS\n");
+  printf("\t-C: input code directory\n");
   printf("\t-h: print this help message\n");
   printf("Examples:\n");
   printf("\t%s -i <path to input binary>\n", self);
+  printf("\t%s -c <path to CMS data> -C <path to code directory>\n", self);
   exit(-1);
 }
 
 void evaluate_code_signature(CT_uint8_t *cmsData, CT_size_t cmsLen,
                              CT_uint8_t *codeDirectoryData,
-                             CT_size_t codeDirectoryLen) {
+                             CT_size_t codeDirectoryLen,
+                             CS_DecodedSuperBlob *superblob) {
   const CT_uint8_t *leafCert = NULL;
   CT_size_t leafCertLen = 0;
   CoreTrustPolicyFlags policyFlags = 0;
@@ -146,66 +151,126 @@ void evaluate_code_signature(CT_uint8_t *cmsData, CT_size_t cmsLen,
     }
     printf(".\n");
 
+   if (superblob) {
+    void *cdhashOut = malloc(CS_CDHASH_LEN);
+   csd_superblob_calculate_best_cdhash(superblob, cdhashOut);
+   
+   if (memcmp(cdhashOut, digestData, CS_CDHASH_LEN) == 0) {
+     printf("CD hash matches the expected hash.\n");
+   } else {
+     printf("CD hash does not match the expected hash.\n");
+   }
+
+   free(cdhashOut);
+   }
+
   } else {
     printf("Error: CTEvaluateAMFICodeSignatureCMS returned 0x%x.\n", result);
   }
 }
 
+void* get_file_data(const char* filename, size_t *sizeOut) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error opening file: %s\n", filename);
+        return NULL;
+    }
+
+    // Seek to the end of the file to determine its size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Allocate memory to store the file contents
+    void *data = malloc(file_size);
+    if (data == NULL) {
+        fprintf(stderr, "Memory allocation error\n");
+        fclose(file);
+        return NULL;
+    }
+
+    // Read the file contents into the allocated memory
+    size_t bytes_read = fread(data, 1, file_size, file);
+    if (bytes_read != file_size) {
+        fprintf(stderr, "Error reading file: %s\n", filename);
+        fclose(file);
+        free(data);
+        return NULL;
+    }
+
+    *sizeOut = bytes_read;
+
+    fclose(file);
+    return data;
+}
+
 int main(int argc, char *argv[]) {
-  const char *inputPath = get_argument_value(argc, argv, "-i");
-  if (!inputPath) {
-    print_usage(argv[0]);
-  }
+ const char *inputPath = get_argument_value(argc, argv, "-i");
+ if (!inputPath) {
 
-  char *preferredSlice = extract_preferred_slice(inputPath);
-  if (!preferredSlice) {
-        printf("Error: failed to extract preferred slice!\n");
-        return -1;
-  }
+    
+    void *inputCMS = get_argument_value(argc, argv, "-c");
+    void *inputCD = get_argument_value(argc, argv, "-C");
+    if (!inputCMS || !inputCD) {
+      print_usage(argv[0]);
+    }
+    size_t cmsSize, cdSize;
+    void *cms = get_file_data(inputCMS, &cmsSize);
+    void *cd = get_file_data(inputCD, &cdSize);
+  
+    evaluate_code_signature(cms, cmsSize, cd, cdSize, NULL);
 
-  MachO *macho = macho_init_for_writing(preferredSlice);
-  if (!macho) {
-    free(preferredSlice);
-    return -1;
-  }
+    return 0;
+ }
 
-  CS_SuperBlob *superblob = macho_read_code_signature(macho);
-  if (!superblob) {
-      printf("Error: no code signature found, please fake-sign the binary at minimum before running the bypass.\n");
-      free(preferredSlice);
-      return -1;
-  }
+ char *preferredSlice = extract_preferred_slice(inputPath);
+ if (!preferredSlice) {
+       printf("Error: failed to extract preferred slice!\n");
+       return -1;
+ }
 
-  CS_DecodedSuperBlob *decodedSuperblob = csd_superblob_decode(superblob);
-  CS_DecodedBlob *signatureBlob = csd_superblob_find_blob(decodedSuperblob, CSSLOT_SIGNATURESLOT, NULL);
-  if (!signatureBlob) {
-      printf("Error: no signature blob found!\n");
-      free(preferredSlice);
-      return -1;
-  }
+ MachO *macho = macho_init_for_writing(preferredSlice);
+ if (!macho) {
+   free(preferredSlice);
+   return -1;
+ }
 
-  size_t sigBlobLen = csd_blob_get_size(signatureBlob) - 8;
-  uint8_t *sigBlob = malloc(sigBlobLen);
-  csd_blob_read(signatureBlob, 8, sigBlobLen, sigBlob);
+ CS_SuperBlob *superblob = macho_read_code_signature(macho);
+ if (!superblob) {
+     printf("Error: no code signature found, please fake-sign the binary at minimum before running the bypass.\n");
+     free(preferredSlice);
+     return -1;
+ }
 
-  CS_DecodedBlob *codeDirectory = csd_superblob_find_blob(decodedSuperblob, CSSLOT_CODEDIRECTORY, NULL);
-  if (!codeDirectory) {
-      printf("Error: no code directory found!\n");
-      free(preferredSlice);
-      return -1;
-  }
+ CS_DecodedSuperBlob *decodedSuperblob = csd_superblob_decode(superblob);
+ CS_DecodedBlob *signatureBlob = csd_superblob_find_blob(decodedSuperblob, CSSLOT_SIGNATURESLOT, NULL);
+ if (!signatureBlob) {
+     printf("Error: no signature blob found!\n");
+     free(preferredSlice);
+     return -1;
+ }
 
-  size_t codeDirectoryBlobLen = csd_blob_get_size(codeDirectory);
-  uint8_t *codeDirectoryBlob = malloc(codeDirectoryBlobLen);
-  csd_blob_read(codeDirectory, 0, codeDirectoryBlobLen, codeDirectoryBlob);
+ size_t sigBlobLen = csd_blob_get_size(signatureBlob) - 8;
+ uint8_t *sigBlob = malloc(sigBlobLen);
+ csd_blob_read(signatureBlob, 8, sigBlobLen, sigBlob);
 
-  csd_superblob_free(decodedSuperblob);
-  free(preferredSlice);
+ CS_DecodedBlob *codeDirectory = csd_superblob_find_blob(decodedSuperblob, CSSLOT_CODEDIRECTORY, NULL);
+ if (!codeDirectory) {
+     printf("Error: no code directory found!\n");
+     free(preferredSlice);
+     return -1;
+ }
 
-  evaluate_code_signature(sigBlob, sigBlobLen, codeDirectoryBlob, codeDirectoryBlobLen);
+ size_t codeDirectoryBlobLen = csd_blob_get_size(codeDirectory);
+ uint8_t *codeDirectoryBlob = malloc(codeDirectoryBlobLen);
+ csd_blob_read(codeDirectory, 0, codeDirectoryBlobLen, codeDirectoryBlob);
 
-  free(sigBlob);
-  free(codeDirectoryBlob);
+evaluate_code_signature(sigBlob, sigBlobLen, codeDirectoryBlob, codeDirectoryBlobLen, decodedSuperblob);
+
+ csd_superblob_free(decodedSuperblob);
+ free(preferredSlice);
+ free(sigBlob);
+ free(codeDirectoryBlob);
 
   return 0;
 }
